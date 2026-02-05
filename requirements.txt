@@ -1,0 +1,16 @@
+fastapi==0.110.0
+uvicorn==0.27.1
+python-dotenv==1.0.1
+openai==1.12.0
+numpy==1.26.4
+pandas==2.2.0
+#chromadb==0.4.22
+tiktoken==0.6.0
+pydantic==2.6.1
+requests==2.31.0
+
+# STT Pipeline Dependencies
+faster-whisper==1.0.3
+pyyaml==6.0.1
+python-multipart==0.0.9
+google-cloud-speech==2.29.0
