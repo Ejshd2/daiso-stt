@@ -5,6 +5,7 @@ Whisper (faster-whisper) + Google Cloud Speech-to-Text
 """
 
 import time
+import numpy as np
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
@@ -137,6 +138,83 @@ class WhisperAdapter(BaseAdapter):
             if segment_count > 0:
                 avg_logprob = logprob_sum / segment_count
                 # Approximate conversion: exp(logprob) gives probability
+                confidence = min(1.0, max(0.0, 1.0 + avg_logprob))
+            
+            latency_ms = int((time.time() - start_time) * 1000)
+            
+            return STTResult(
+                text_raw=full_text if full_text else None,
+                confidence=confidence,
+                lang=self.language,
+                latency_ms=latency_ms,
+                error=None
+            )
+            
+        except Exception as e:
+            latency_ms = int((time.time() - start_time) * 1000)
+            return STTResult(
+                text_raw=None,
+                confidence=None,
+                lang=self.language,
+                latency_ms=latency_ms,
+                error=str(e)
+            )
+    
+    def transcribe_bytes(
+        self, 
+        pcm_bytes: bytes, 
+        sample_rate: int = 16000
+    ) -> STTResult:
+        """
+        PCM16 bytes를 직접 인식 (임시파일 없이 메모리에서 처리)
+        
+        Args:
+            pcm_bytes: 16-bit signed integer PCM bytes (mono)
+            sample_rate: 샘플레이트 (기본 16000)
+            
+        Returns:
+            STTResult
+        """
+        start_time = time.time()
+        
+        try:
+            if not pcm_bytes or len(pcm_bytes) < 3200:  # 최소 100ms
+                return STTResult(
+                    text_raw=None, confidence=None,
+                    lang=self.language, latency_ms=0,
+                    error="Audio too short for transcription"
+                )
+            
+            # PCM16 bytes → numpy float32 waveform (-1.0 ~ 1.0)
+            audio_np = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+            
+            # faster-whisper supports numpy array input
+            segments, info = self.model.transcribe(
+                audio_np,
+                language=self.language,
+                beam_size=5,
+                vad_filter=True,
+                vad_parameters=dict(
+                    min_silence_duration_ms=500,
+                    speech_pad_ms=200
+                )
+            )
+            
+            # Collect segments
+            text_parts = []
+            logprob_sum = 0
+            segment_count = 0
+            
+            for segment in segments:
+                text_parts.append(segment.text.strip())
+                logprob_sum += segment.avg_logprob
+                segment_count += 1
+            
+            full_text = " ".join(text_parts).strip()
+            
+            confidence = None
+            if segment_count > 0:
+                avg_logprob = logprob_sum / segment_count
                 confidence = min(1.0, max(0.0, 1.0 + avg_logprob))
             
             latency_ms = int((time.time() - start_time) * 1000)

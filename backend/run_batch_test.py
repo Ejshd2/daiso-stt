@@ -35,6 +35,7 @@ sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='repla
 sys.path.insert(0, str(Path(__file__).parent))
 
 from stt import get_adapter, QualityGate, PolicyGate, AudioConverter
+from stt import TextPostprocessor, AudioPreprocessor
 from stt.types import STTResult
 
 
@@ -144,6 +145,14 @@ class BatchTestRunner:
         
         # Initialize gates
         self.quality_gate = QualityGate(**self.config["quality_gate"])
+        
+        # Initialize preprocessor/postprocessor (v2 고도화)
+        self.preprocessor = AudioPreprocessor(
+            output_dir=str(self.output_dir / "preprocessed")
+        )
+        self.postprocessor = TextPostprocessor(
+            config=self.config.get("postprocessing", {})
+        )
         
         print("[OK] All components initialized")
         
@@ -268,8 +277,24 @@ class BatchTestRunner:
         utterance_type = manifest_entry.get('utterance_type', 'unknown') if manifest_entry else 'unknown'
         
         try:
+            # 0. 전처리 (v2 고도화: 볼륨 정규화 + 옵션 노이즈 제거)
+            preprocess_config = self.config.get("preprocessing", {})
+            try:
+                preprocessed_path, preprocess_meta = self.preprocessor.preprocess(
+                    str(audio_path),
+                    preprocess_config,
+                    test_id,
+                    provider
+                )
+            except Exception:
+                preprocessed_path = str(audio_path)
+                preprocess_meta = {
+                    "preprocessing_executed": False,
+                    "preprocessing_time_ms": 0
+                }
+            
             # 1. Normalize audio (conversion time excluded from latency)
-            conversion_result = self.converter.normalize(str(audio_path))
+            conversion_result = self.converter.normalize(preprocessed_path)
             normalized_path = conversion_result["normalized_path"]
             audio_metadata = conversion_result["audio_metadata"]
             duration_sec = audio_metadata["normalized"]["duration_sec"]
@@ -288,18 +313,42 @@ class BatchTestRunner:
                 stt_result.text_raw.strip() == ""
             )
             
-            # 5. Calculate metrics (only if not failure)
+            # 5. 후처리 (v2 고도화: text_raw 보존, text_processed 생성)
+            text_raw = stt_result.text_raw
+            text_processed = None
+            postprocess_executed = False
+            postprocess_time_ms = 0
+            
+            if not is_failure and text_raw:
+                import time as time_module
+                post_start = time_module.time()
+                try:
+                    postprocess_config = self.config.get("postprocessing", {})
+                    text_processed = self.postprocessor.postprocess(text_raw, postprocess_config)
+                    postprocess_executed = True
+                except Exception:
+                    text_processed = text_raw  # fallback
+                postprocess_time_ms = int((time_module.time() - post_start) * 1000)
+            
+            # 6. Calculate metrics
             cer = None
             keyword_hit = None
             matched_keywords = []
             
+            # CER은 text_raw 기준 (원문 비교)
             if not is_failure and expected_text:
-                cer = self._calculate_cer(expected_text, stt_result.text_raw)
+                cer = self._calculate_cer(expected_text, text_raw)
             
+            # Keyword Hit은 text_processed 기준 (후처리 적용)
             if not is_failure and gt_keywords:
-                keyword_hit, matched_keywords = self._check_keyword_hit(stt_result.text_raw, gt_keywords)
+                # text_processed가 None/empty면 keyword_hit=False
+                if text_processed and text_processed.strip():
+                    keyword_hit, matched_keywords = self._check_keyword_hit(text_processed, gt_keywords)
+                else:
+                    keyword_hit = False
+                    matched_keywords = []
             
-            # 6. Calculate cost
+            # 7. Calculate cost
             cost_info = CostCalculator.calculate(duration_sec, provider, model)
             
             # Build result
@@ -316,7 +365,8 @@ class BatchTestRunner:
                 "provider": provider,
                 "model": model,
                 
-                "stt_text": stt_result.text_raw,
+                "stt_text": text_raw,
+                "stt_text_processed": text_processed,  # v2 신규
                 "confidence": stt_result.confidence,
                 "latency_ms": stt_result.latency_ms,
                 "error": stt_result.error,
@@ -327,7 +377,13 @@ class BatchTestRunner:
                 "matched_keywords": matched_keywords,
                 
                 "audio_duration_sec": duration_sec,
-                "cost_usd": cost_info["calculated_cost_usd"]
+                "cost_usd": cost_info["calculated_cost_usd"],
+                
+                # v2 고도화 메타데이터
+                "preprocessing_executed": preprocess_meta.get("preprocessing_executed", False),
+                "preprocessing_time_ms": preprocess_meta.get("preprocessing_time_ms", 0),
+                "postprocessing_executed": postprocess_executed,
+                "postprocessing_time_ms": postprocess_time_ms
             }
             
             return result
@@ -344,7 +400,10 @@ class BatchTestRunner:
                 "error": str(e),
                 "cer": None,
                 "keyword_hit": None,
-                "latency_ms": None
+                "latency_ms": None,
+                "stt_text_processed": None,
+                "preprocessing_executed": False,
+                "postprocessing_executed": False
             }
     
     def run_batch(self, providers: List[str] = None) -> str:
@@ -399,7 +458,10 @@ class BatchTestRunner:
                         cer = result.get("cer")
                         cer_str = f"CER={cer:.2%}" if cer is not None else ""
                         kw_hit = "[KW]" if result.get("keyword_hit") else ""
-                        print(f"  [OK] \"{text}\" {cer_str} {kw_hit}")
+                        # v2: PREP/POST 상태 표시
+                        prep_status = "[PREP]" if result.get("preprocessing_executed") else ""
+                        post_status = "[POST]" if result.get("postprocessing_executed") else ""
+                        print(f"  [OK] \"{text}\" {cer_str} {kw_hit} {prep_status}{post_status}")
                     else:
                         print(f"  [FAIL] {result.get('error', 'No transcription')}")
                     
