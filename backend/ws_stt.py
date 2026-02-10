@@ -3,6 +3,11 @@
 WebSocket endpoint for real-time streaming STT
 Uses Google Cloud Speech-to-Text v1 API with SpeechHelpers signature
 STT WORKER THREAD VERSION - streaming_recognize + response iteration in same thread
+
+v2: Whisper Fallback 지원
+- Google Streaming 실패 시 (SILENCE stop 후 final 없음)
+- Ring buffer의 PCM을 Whisper로 fallback 인식
+- 프로세스 싱글톤 lazy load (동시성 대비 Lock)
 """
 
 import asyncio
@@ -14,6 +19,7 @@ import struct
 import traceback
 import csv
 import os
+import numpy as np
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Iterator, Dict
@@ -29,11 +35,53 @@ from google.cloud.speech_v1.types import (
 )
 from google.oauth2 import service_account
 
+# Whisper Fallback imports
+try:
+    from stt.adapters import WhisperAdapter
+    WHISPER_ADAPTER_AVAILABLE = True
+except ImportError:
+    try:
+        from backend.stt.adapters import WhisperAdapter
+        WHISPER_ADAPTER_AVAILABLE = True
+    except ImportError:
+        WHISPER_ADAPTER_AVAILABLE = False
+
+# Postprocessor
+try:
+    from stt.text_postprocessor import TextPostprocessor
+    POSTPROCESSOR_AVAILABLE = True
+except ImportError:
+    try:
+        from backend.stt.text_postprocessor import TextPostprocessor
+        POSTPROCESSOR_AVAILABLE = True
+    except ImportError:
+        POSTPROCESSOR_AVAILABLE = False
+
+
+# Audio preprocessor (volume normalization, denoise)
+try:
+    from pydub import AudioSegment
+    PYDUB_AVAILABLE = True
+except ImportError:
+    PYDUB_AVAILABLE = False
+
+try:
+    import noisereduce as nr
+    NOISEREDUCE_AVAILABLE = True
+except ImportError:
+    NOISEREDUCE_AVAILABLE = False
+
+# Config loader
+import yaml
+
 # Session configuration
 MAX_SESSION_DURATION_SEC = 30
 SILENCE_TIMEOUT_SEC = 3.0
 SAMPLE_RATE = 16000
 LANGUAGE_CODE = "ko-KR"
+
+# Ring buffer default (config에서 override)
+DEFAULT_BUFFER_MAX_SEC = 8
 
 # Logging configuration
 CSV_LOG_PATH = Path("outputs/streaming_poc_results.csv")
@@ -43,13 +91,83 @@ AUDIO_SAVE_ENABLED = False  # Feature flag (controlled by metadata)
 # CSV Header
 CSV_HEADER = [
     "timestamp", "run_id", "test_id", "utterance_type", "spoken_text_ref",
-    "final_transcript", "confidence", "status", "failure_reason",
+    "text_raw", "text_processed", "final_transcript",
+    "confidence", "status", "failure_reason",
     "first_interim_latency_ms", "final_latency_ms", "duration_sec", 
-    "chunk_count", "audio_path"
+    "chunk_count", "audio_path",
+    "fallback_used", "fallback_provider", "fallback_latency_ms",
+    "fallback_reason"
 ]
 
 # Thread lock for CSV writing
 csv_lock = threading.Lock()
+
+
+def load_postprocessing_config() -> Dict:
+    """Load postprocessing config from config.yaml"""
+    candidate_paths = [
+        Path(__file__).parent / "config.yaml",
+        Path("backend") / "config.yaml",
+        Path("config.yaml"),
+    ]
+    for config_path in candidate_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+                return config.get("postprocessing", {})
+            except Exception:
+                pass
+    return {}
+
+
+# 모듈 레벨 싱글톤 postprocessor (Google/Fallback 공용)
+_postprocessor_instance: Optional['TextPostprocessor'] = None
+_postprocessor_config: Optional[Dict] = None
+
+def get_postprocessor() -> Optional['TextPostprocessor']:
+    """싱글톤 TextPostprocessor 반환"""
+    global _postprocessor_instance, _postprocessor_config
+    if _postprocessor_instance is not None:
+        return _postprocessor_instance
+    if not POSTPROCESSOR_AVAILABLE:
+        return None
+    try:
+        _postprocessor_config = load_postprocessing_config()
+        if not _postprocessor_config.get("enabled", True):
+            return None
+        _postprocessor_instance = TextPostprocessor(config=_postprocessor_config)
+        print(f"✅ TextPostprocessor initialized (singleton)")
+        return _postprocessor_instance
+    except Exception as e:
+        print(f"⚠️ TextPostprocessor init failed: {e}")
+        return None
+
+
+def load_fallback_config() -> Dict:
+    """Load fallback config from config.yaml"""
+    # 여러 경로 시도 (실행 위치에 따라 다를 수 있음)
+    candidate_paths = [
+        Path(__file__).parent / "config.yaml",          # backend/config.yaml (from ws_stt.py)
+        Path("backend") / "config.yaml",                 # backend/config.yaml (from project root)
+        Path("config.yaml"),                              # config.yaml (from backend/)
+    ]
+    
+    for config_path in candidate_paths:
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f)
+                fb_config = config.get("fallback", {})
+                print(f"✅ Fallback config loaded from: {config_path.resolve()}")
+                print(f"   enabled={fb_config.get('enabled')}, whisper={fb_config.get('whisper', {})}")
+                return fb_config
+            except Exception as e:
+                print(f"⚠️ Failed to load config from {config_path}: {e}")
+    
+    print("⚠️ No config.yaml found, fallback disabled")
+    return {"enabled": False}
+
 
 def append_to_csv_log(row_data: Dict):
     """Thread-safe CSV append"""
@@ -73,11 +191,196 @@ def append_to_csv_log(row_data: Dict):
         print(f"❌ CSV Log Error: {e}")
 
 
+# ============================================================
+# WhisperFallbackManager: 프로세스 싱글톤 lazy load
+# ============================================================
+
+class WhisperFallbackManager:
+    """
+    프로세스 단위 싱글톤 Whisper 모델 관리.
+    - 첫 fallback 요청 시 한 번만 로드
+    - 이후 재사용
+    - 동시 로딩/인식 방지 Lock
+    """
+    _instance: Optional['WhisperFallbackManager'] = None
+    _init_lock = threading.Lock()
+    _transcribe_lock = threading.Lock()
+    
+    def __init__(self):
+        self.model: Optional[WhisperAdapter] = None
+        self.postprocessor: Optional[TextPostprocessor] = None
+        self._loaded = False
+        self._fallback_config = load_fallback_config()
+    
+    @classmethod
+    def get_instance(cls) -> 'WhisperFallbackManager':
+        """Thread-safe 싱글톤 (Double-checked locking)"""
+        if cls._instance is None:
+            with cls._init_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+    
+    def _ensure_loaded(self):
+        """Lazy load: 첫 호출 시에만 모델 로드"""
+        if self._loaded:
+            return
+        
+        with self._init_lock:
+            if self._loaded:
+                return
+            
+            whisper_cfg = self._fallback_config.get("whisper", {})
+            
+            if not WHISPER_ADAPTER_AVAILABLE:
+                print("⚠️ WhisperAdapter not available for fallback")
+                self._loaded = True
+                return
+            
+            try:
+                self.model = WhisperAdapter(
+                    model_size=whisper_cfg.get("model_size", "medium"),
+                    device=whisper_cfg.get("device", "cpu"),
+                    compute_type=whisper_cfg.get("compute_type", "int8"),
+                    fallback_model=whisper_cfg.get("fallback_model", "small"),
+                    language=whisper_cfg.get("language", "ko")
+                )
+                print("✅ Whisper fallback model loaded (singleton)")
+            except Exception as e:
+                print(f"❌ Whisper fallback model load failed: {e}")
+                self.model = None
+            
+            # Postprocessor
+            if POSTPROCESSOR_AVAILABLE and self._fallback_config.get("postprocess", True):
+                try:
+                    config_path = Path(__file__).parent / "config.yaml"
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        full_config = yaml.safe_load(f)
+                    self.postprocessor = TextPostprocessor(
+                        config=full_config.get("postprocessing", {})
+                    )
+                except Exception:
+                    self.postprocessor = None
+            
+            self._loaded = True
+    
+    def is_available(self) -> bool:
+        """Fallback 사용 가능 여부 (모델 로드 포함)"""
+        if not self._fallback_config.get("enabled", False):
+            print("⚠️ Fallback disabled in config")
+            return False
+        if not WHISPER_ADAPTER_AVAILABLE:
+            print("⚠️ WhisperAdapter import not available")
+            return False
+        # 모델이 아직 안 로드되었으면 로드 시도
+        self._ensure_loaded()
+        if not self.model:
+            print("⚠️ Whisper model not loaded")
+            return False
+        return True
+    
+    def transcribe_fallback(self, pcm_bytes: bytes) -> Dict:
+        """
+        Fallback 인식 수행 (Lock 보호)
+        
+        Args:
+            pcm_bytes: 16kHz 16-bit mono PCM bytes
+            
+        Returns:
+            {"text": str, "confidence": float, "latency_ms": int, "error": str|None}
+        """
+        self._ensure_loaded()
+        
+        if not self.model:
+            return {
+                "text": "", "confidence": 0.0, "latency_ms": 0,
+                "error": "Whisper model not loaded"
+            }
+        
+        preprocess_cfg = self._fallback_config.get("preprocess", {})
+        
+        # 전처리: 볼륨 정규화 + denoise (PCM bytes 단위)
+        processed_bytes = pcm_bytes
+        if PYDUB_AVAILABLE:
+            try:
+                processed_bytes = self._preprocess_pcm(
+                    pcm_bytes, preprocess_cfg
+                )
+            except Exception as e:
+                print(f"⚠️ Fallback preprocess failed, using raw: {e}")
+        
+        # Whisper 인식 (동시 접근 방지)
+        with self._transcribe_lock:
+            result = self.model.transcribe_bytes(processed_bytes, sample_rate=SAMPLE_RATE)
+        
+        text_raw = result.text_raw or ""
+        
+        # 후처리 (raw는 보존)
+        text_processed = text_raw
+        pp_config = load_postprocessing_config()
+        if text_raw and pp_config.get("apply_to_fallback", True):
+            pp = get_postprocessor()
+            if pp:
+                try:
+                    text_processed = pp.postprocess(text_raw)
+                except Exception:
+                    pass
+        
+        return {
+            "text_raw": text_raw,
+            "text_processed": text_processed,
+            "confidence": result.confidence or 0.0,
+            "latency_ms": result.latency_ms,
+            "error": result.error
+        }
+    
+    def _preprocess_pcm(self, pcm_bytes: bytes, config: Dict) -> bytes:
+        """
+        PCM bytes 전처리 (볼륨 정규화 + denoise)
+        파일 없이 메모리에서 처리
+        """
+        # PCM bytes → AudioSegment
+        audio = AudioSegment(
+            data=pcm_bytes,
+            sample_width=2,  # 16-bit
+            frame_rate=SAMPLE_RATE,
+            channels=1
+        )
+        
+        # 1. 볼륨 정규화
+        if config.get("volume_normalize", True):
+            target_dBFS = config.get("target_dBFS", -20.0)
+            current_dBFS = audio.dBFS
+            change = target_dBFS - current_dBFS
+            if abs(change) > 30:
+                change = 30 if change > 0 else -30
+            audio = audio.apply_gain(change)
+        
+        # 2. Denoise
+        if config.get("denoise", True) and NOISEREDUCE_AVAILABLE:
+            samples = np.array(audio.get_array_of_samples())
+            reduced = nr.reduce_noise(
+                y=samples.astype(np.float32),
+                sr=SAMPLE_RATE,
+                prop_decrease=0.8,
+                stationary=True
+            )
+            audio = audio._spawn(reduced.astype(np.int16).tobytes())
+        
+        # AudioSegment → PCM bytes
+        return audio.raw_data
+
+
+# ============================================================
+# StreamingSTTSession: Google Streaming + Whisper Fallback
+# ============================================================
+
 class StreamingSTTSession:
     """
     Streaming STT session with proper thread structure:
     - WS thread: receives audio → queue.put()
     - STT worker thread: streaming_recognize + response iteration
+    - Fallback: SILENCE stop 후 final 없으면 Whisper로 인식
     """
     
     def __init__(self, websocket: WebSocket, credentials_path: str, meta: dict = None):
@@ -104,8 +407,23 @@ class StreamingSTTSession:
         self.chunk_count = 0
         self.response_count = 0
         
-        # Audio Buffer for saving
+        # Audio Ring Buffer - 항상 쌓음 (save_audio와 무관)
         self.full_audio_buffer = bytearray()
+        # buffer_max_sec: config → 기본값 fallback
+        fb_cfg = load_fallback_config()
+        buffer_sec = fb_cfg.get("buffer_max_sec", DEFAULT_BUFFER_MAX_SEC)
+        self._buffer_max_bytes = SAMPLE_RATE * 2 * buffer_sec
+        print(f"📦 Ring buffer: {buffer_sec}sec ({self._buffer_max_bytes} bytes)")
+        
+        # Postprocessor 참조 (싱글톤)
+        self._postprocessor = get_postprocessor()
+        self._pp_config = load_postprocessing_config()
+        
+        # Fallback state
+        self._fallback_triggered = False  # 세션 단위 중복 방지
+        self._got_final = False  # final 결과 수신 여부
+        self._fallback_result: Optional[Dict] = None
+        self.force_fallback = self.meta.get("force_fallback", False)  # 테스트용 강제 Fallback
         
         # Thread reference
         self.worker_thread = None
@@ -139,8 +457,17 @@ class StreamingSTTSession:
             self.first_interim_ts = time.time()
         await self.send_message({"type": "interim", "text": text, "is_final": False})
     
-    async def send_final(self, text: str, confidence: float = 0.0, status: str = "OK", failure_reason: str = ""):
+    async def send_final(
+        self, text_raw: str = "", text_processed: str = "",
+        confidence: float = 0.0, 
+        status: str = "OK", failure_reason: str = "",
+        fallback_used: bool = False, fallback_provider: str = "",
+        fallback_latency_ms: int = 0, fallback_reason: str = ""
+    ):
         self.final_ts = time.time()
+        
+        # 최종 text는 text_processed (없으면 text_raw)
+        text = text_processed if text_processed else text_raw
         
         duration_sec = (self.final_ts - self.start_ts) if self.start_ts else 0
         final_latency_ms = int(duration_sec * 1000)
@@ -150,14 +477,20 @@ class StreamingSTTSession:
             "confidence": round(confidence, 4),
             "latency_ms": final_latency_ms,
             "first_interim_ms": first_interim_latency,
-            "duration_sec": round(duration_sec, 2)
+            "duration_sec": round(duration_sec, 2),
+            "text_raw": text_raw,
+            "text_processed": text_processed,
+            "fallback_used": fallback_used,
+            "fallback_provider": fallback_provider,
+            "fallback_latency_ms": fallback_latency_ms,
+            "fallback_reason": fallback_reason
         }
         
         await self.send_message({
             "type": "final", "text": text, "is_final": True,
             "status": status, "meta": meta
         })
-        print(f"📝 final transcript: '{text}' | {status} | {confidence:.2f}")
+        print(f"📝 final: raw='{text_raw}' | processed='{text_processed}' | {status} | conf={confidence:.2f} | fallback={fallback_used}")
         
         # 1. Save Audio if enabled
         audio_path_str = ""
@@ -189,6 +522,8 @@ class StreamingSTTSession:
             "test_id": self.test_id,
             "utterance_type": self.meta.get("utterance_type", ""),
             "spoken_text_ref": self.meta.get("spoken_text", ""),
+            "text_raw": text_raw,
+            "text_processed": text_processed,
             "final_transcript": text,
             "confidence": round(confidence, 4),
             "status": status,
@@ -197,7 +532,11 @@ class StreamingSTTSession:
             "final_latency_ms": final_latency_ms,
             "duration_sec": round(duration_sec, 2),
             "chunk_count": self.chunk_count,
-            "audio_path": audio_path_str
+            "audio_path": audio_path_str,
+            "fallback_used": fallback_used,
+            "fallback_provider": fallback_provider,
+            "fallback_latency_ms": fallback_latency_ms,
+            "fallback_reason": fallback_reason
         }
         append_to_csv_log(log_data)
     
@@ -218,9 +557,12 @@ class StreamingSTTSession:
                 
                 self.chunk_count += 1
                 
-                # Buffer for saving
-                if self.save_audio or AUDIO_SAVE_ENABLED:
-                    self.full_audio_buffer.extend(chunk)
+                # Ring buffer: 항상 쌓기 (save_audio 무관)
+                self.full_audio_buffer.extend(chunk)
+                # Ring buffer max 유지
+                if len(self.full_audio_buffer) > self._buffer_max_bytes:
+                    overflow = len(self.full_audio_buffer) - self._buffer_max_bytes
+                    del self.full_audio_buffer[:overflow]
                 
                 yield StreamingRecognizeRequest(audio_content=chunk)
                 
@@ -232,6 +574,7 @@ class StreamingSTTSession:
     def _stt_worker_thread(self):
         """
         STT worker thread: streaming_recognize + response iteration
+        Fallback은 여기서 트리거하지 않음 (_process_results에서 처리)
         """
         print("🔧 STT worker: thread started")
         
@@ -266,7 +609,18 @@ class StreamingSTTSession:
                     conf = getattr(alt, 'confidence', 0.0)
                     
                     if result.is_final:
-                        self.result_queue.put({"type": "final", "text": text, "confidence": conf})
+                        self._got_final = True
+                        if self.force_fallback:
+                            # 강제 Fallback 모드: Google final 무시 → Whisper로
+                            print(f"🔧 force_fallback=True → Google final 무시: '{text}'")
+                            self.result_queue.put({
+                                "type": "final", "text": "", "confidence": 0.0,
+                                "status": "FORCE_FALLBACK", "reason": "force_fallback enabled",
+                                "needs_fallback": True,
+                                "google_text": text, "google_confidence": conf
+                            })
+                        else:
+                            self.result_queue.put({"type": "final", "text": text, "confidence": conf})
                         self.stop_event.set()
                         return
                     else:
@@ -274,14 +628,51 @@ class StreamingSTTSession:
             
             # Response loop ended without final
             status = "NO_SPEECH" if self.chunk_count == 0 else "TOO_SHORT"
-            self.result_queue.put({"type": "final", "text": "", "confidence": 0.0, "status": status, "reason": "No final result"})
+            self.result_queue.put({
+                "type": "final", "text": "", "confidence": 0.0, 
+                "status": status, "reason": "No final result",
+                "needs_fallback": True  # Fallback 필요 표시
+            })
             
         except Exception as e:
             print(f"❌ STT worker error: {e}")
             traceback.print_exc()
-            self.result_queue.put({"type": "error", "message": str(e)})
+            self.result_queue.put({
+                "type": "error", "message": str(e),
+                "needs_fallback": True
+            })
         finally:
             print("🔧 STT worker: thread finished")
+    
+    def _run_whisper_fallback(self) -> Dict:
+        """
+        Whisper fallback 실행 (동기, worker thread에서 호출 가능)
+        
+        Returns:
+            {"text": str, "confidence": float, "latency_ms": int, 
+             "provider": str, "error": str|None}
+        """
+        manager = WhisperFallbackManager.get_instance()
+        
+        if not manager.is_available():
+            return {
+                "text": "", "confidence": 0.0, "latency_ms": 0,
+                "provider": "whisper", "error": "Fallback not available"
+            }
+        
+        buffer_bytes = bytes(self.full_audio_buffer)
+        buffer_duration_sec = len(buffer_bytes) / (SAMPLE_RATE * 2)
+        print(f"🔄 Whisper fallback: {len(buffer_bytes)} bytes ({buffer_duration_sec:.1f}s)")
+        
+        if len(buffer_bytes) < 3200:  # 최소 100ms
+            return {
+                "text": "", "confidence": 0.0, "latency_ms": 0,
+                "provider": "whisper", "error": "Buffer too short"
+            }
+        
+        result = manager.transcribe_fallback(buffer_bytes)
+        result["provider"] = "whisper"
+        return result
     
     async def process_audio(self, pcm_b64: str, seq: int):
         """Called from WS thread - puts audio into queue for worker"""
@@ -305,27 +696,144 @@ class StreamingSTTSession:
     
     async def _process_results(self):
         """Process results from STT worker and send to WS"""
-        # Keep running until is_running becomes False (set by self or stop timeout)
-        # unrelated to stop_event (which is for worker thread)
         while self.is_running:
             try:
                 r = self.result_queue.get_nowait()
                 if r["type"] == "interim":
                     await self.send_interim(r["text"])
                 elif r["type"] == "final":
+                    text_raw = r["text"]
+                    confidence = r.get("confidence", 0.0)
+                    status = r.get("status", "OK")
+                    reason = r.get("reason", "")
+                    needs_fallback = r.get("needs_fallback", False)
+                    
+                    fallback_used = False
+                    fallback_provider = ""
+                    fallback_latency_ms = 0
+                    fallback_reason = ""
+                    
+                    # Fallback 판정
+                    if (
+                        needs_fallback and
+                        (not text_raw or text_raw.strip() == "") and
+                        not self._fallback_triggered and
+                        len(self.full_audio_buffer) > 3200
+                    ):
+                        self._fallback_triggered = True
+                        
+                        # fallback_reason 표준화
+                        if self.force_fallback:
+                            fallback_reason = "FORCE"
+                        elif status in ("NO_SPEECH", "TOO_SHORT"):
+                            fallback_reason = "SILENCE_NO_FINAL"
+                        else:
+                            fallback_reason = "SILENCE_NO_FINAL"
+                        
+                        print(f"🔄 Triggering Whisper fallback (reason: {fallback_reason})...")
+                        
+                        fb_result = await asyncio.get_event_loop().run_in_executor(
+                            None, self._run_whisper_fallback
+                        )
+                        
+                        if fb_result.get("text_raw") or fb_result.get("text_processed"):
+                            text_raw = fb_result.get("text_raw", "")
+                            confidence = fb_result.get("confidence", 0.0)
+                            status = "FALLBACK_OK"
+                            reason = ""
+                            fallback_used = True
+                            fallback_provider = fb_result.get("provider", "whisper")
+                            fallback_latency_ms = fb_result.get("latency_ms", 0)
+                            print(f"✅ Fallback success: raw='{text_raw}'")
+                        else:
+                            status = "FALLBACK_FAIL"
+                            reason = fb_result.get("error", "Fallback returned empty")
+                            fallback_used = True
+                            fallback_provider = "whisper"
+                            fallback_latency_ms = fb_result.get("latency_ms", 0)
+                            print(f"❌ Fallback failed: {reason}")
+                    
+                    # postprocess 적용
+                    text_processed = text_raw
+                    if fallback_used:
+                        # Fallback 결과에는 이미 processed 포함
+                        text_processed = fb_result.get("text_processed", text_raw)
+                    elif text_raw and self._pp_config.get("apply_to_google", True):
+                        pp = get_postprocessor()
+                        if pp:
+                            try:
+                                text_processed = pp.postprocess(text_raw)
+                            except Exception:
+                                pass
+                    
                     await self.send_final(
-                        text=r["text"], 
-                        confidence=r.get("confidence", 0.0), 
-                        status=r.get("status", "OK"),
-                        failure_reason=r.get("reason", "")
+                        text_raw=text_raw, text_processed=text_processed,
+                        confidence=confidence,
+                        status=status, failure_reason=reason,
+                        fallback_used=fallback_used,
+                        fallback_provider=fallback_provider,
+                        fallback_latency_ms=fallback_latency_ms,
+                        fallback_reason=fallback_reason
                     )
                     self.is_running = False
                     self.stop_event.set()
+                    
                 elif r["type"] == "error":
-                    await self.send_error(r["message"])
-                    await self.send_final(text="", status="FAIL", failure_reason=r["message"]) # Log failure
+                    needs_fallback = r.get("needs_fallback", False)
+                    error_msg = r["message"]
+                    
+                    fallback_used = False
+                    fallback_provider = ""
+                    fallback_latency_ms = 0
+                    fallback_reason = ""
+                    text_raw = ""
+                    text_processed = ""
+                    status = "FAIL"
+                    
+                    # Error에서도 fallback 시도
+                    if (
+                        needs_fallback and
+                        not self._fallback_triggered and
+                        len(self.full_audio_buffer) > 3200
+                    ):
+                        self._fallback_triggered = True
+                        fallback_reason = "GOOGLE_ERROR"
+                        print(f"🔄 Triggering Whisper fallback (reason: {fallback_reason}, error: {error_msg})...")
+                        
+                        fb_result = await asyncio.get_event_loop().run_in_executor(
+                            None, self._run_whisper_fallback
+                        )
+                        
+                        if fb_result.get("text_raw") or fb_result.get("text_processed"):
+                            text_raw = fb_result.get("text_raw", "")
+                            text_processed = fb_result.get("text_processed", text_raw)
+                            status = "FALLBACK_OK"
+                            error_msg = ""
+                            fallback_used = True
+                            fallback_provider = fb_result.get("provider", "whisper")
+                            fallback_latency_ms = fb_result.get("latency_ms", 0)
+                            print(f"✅ Fallback success: raw='{text_raw}'")
+                        else:
+                            fallback_used = True
+                            fallback_provider = "whisper"
+                            fallback_latency_ms = fb_result.get("latency_ms", 0)
+                            status = "FALLBACK_FAIL"
+                            print(f"❌ Fallback also failed")
+                    
+                    if not fallback_used:
+                        await self.send_error(error_msg)
+                    
+                    await self.send_final(
+                        text_raw=text_raw, text_processed=text_processed,
+                        status=status, failure_reason=error_msg,
+                        fallback_used=fallback_used,
+                        fallback_provider=fallback_provider,
+                        fallback_latency_ms=fallback_latency_ms,
+                        fallback_reason=fallback_reason
+                    )
                     self.is_running = False
                     self.stop_event.set()
+                    
             except Empty:
                 await asyncio.sleep(0.05)
     
@@ -357,19 +865,13 @@ class StreamingSTTSession:
 
         self.audio_queue.put(None)  # Poison pill
         
-        # Do not set is_running = False here. 
-        # Let the worker finish and msg pass to _process_results.
-        # _process_results will set is_running = False when it sees "final" or "error".
-        
         # Wait for worker to finish (with timeout)
         if self.worker_thread and self.worker_thread.is_alive():
-            # Run join in executor to avoid blocking event loop
             await asyncio.get_event_loop().run_in_executor(None, self.worker_thread.join, 2.0)
             if self.worker_thread.is_alive():
                 print("⚠️ Worker thread still alive after timeout")
         
         # Ensure we don't hang forever if worker failed to produce result
-        # Force shutdown after short grace period if still running
         for _ in range(10): 
             if not self.is_running: 
                 break
@@ -428,4 +930,3 @@ async def handle_streaming_stt(websocket: WebSocket, credentials_path: str = "ba
         traceback.print_exc()
         if session:
             await session.stop("ERROR")
-
